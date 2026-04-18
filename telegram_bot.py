@@ -27,7 +27,7 @@ from telegram.ext import (
 )
 
 import config
-import notion_client as nc
+import notion_db as nc
 from data_fetcher import get_stock_info
 from decision_engine import evaluate
 from behavior_analysis import analyze_behavior

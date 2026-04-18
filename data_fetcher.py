@@ -38,6 +38,9 @@ def fetch_history(symbol: str, days: int = INDICATOR_LOOKBACK_DAYS) -> Optional[
         if df.empty:
             log.warning("No data returned for %s", sym)
             return None
+        # yfinance ≥0.2.x returns MultiIndex columns for single ticker — flatten it
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
         df.index = pd.to_datetime(df.index)
         log.info("Fetched %d rows for %s", len(df), sym)
         return df
