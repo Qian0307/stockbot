@@ -37,8 +37,6 @@ _SESSION.headers.update({
 _TWSE_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 # TWSE historical daily data API (returns one month per request)
 _TWSE_HISTORY_URL = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
-# Stooq CSV API — free, no key, works from cloud IPs
-_STOOQ_URL = "https://stooq.com/q/d/l/"
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -178,60 +176,6 @@ def _twse_history(symbol: str, months: int = 4) -> Optional[pd.DataFrame]:
     return df
 
 
-# ── Stooq history for US stocks ────────────────────────────────────────────
-
-def _stooq_history(symbol: str, days: int) -> Optional[pd.DataFrame]:
-    """
-    Fetch daily OHLCV from Stooq CSV API.
-    Stooq ticker: TSLA → tsla.us
-    """
-    stooq_sym = symbol.lower().replace(".tw", "").replace(".two", "")
-    if not _is_taiwan(symbol):
-        stooq_sym = stooq_sym + ".us"
-
-    end = datetime.utcnow()
-    start = end - timedelta(days=days)
-
-    try:
-        resp = requests.get(
-            _STOOQ_URL,
-            params={
-                "s": stooq_sym,
-                "d1": start.strftime("%Y%m%d"),
-                "d2": end.strftime("%Y%m%d"),
-                "i": "d",
-            },
-            timeout=10,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        text = resp.text.strip()
-        log.info("Stooq raw response for %s (first 120 chars): %s", stooq_sym, text[:120])
-
-        if resp.status_code != 200 or len(text) < 30 or text.startswith("<"):
-            log.warning("Stooq returned invalid response for %s", stooq_sym)
-            return None
-
-        from io import StringIO
-        df = pd.read_csv(StringIO(text), on_bad_lines="skip")
-
-        # Normalise column names (Stooq uses Title Case)
-        df.columns = [c.strip().title() for c in df.columns]
-        if "Date" not in df.columns:
-            log.warning("Stooq: no Date column for %s, columns=%s", stooq_sym, df.columns.tolist())
-            return None
-
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
-
-        if df.empty:
-            return None
-
-        log.info("Stooq history: %d rows for %s", len(df), symbol)
-        return df
-    except Exception as exc:
-        log.warning("Stooq fetch failed for %s: %s", symbol, exc)
-        return None
-
 
 def _yf_chart_api(symbol: str, days: int) -> Optional[pd.DataFrame]:
     """
@@ -325,12 +269,7 @@ def fetch_history(symbol: str, days: int = INDICATOR_LOOKBACK_DAYS) -> Optional[
         df.index = pd.to_datetime(df.index)
         return df
 
-    log.info("yfinance failed for %s, trying Stooq...", sym)
-    df = _stooq_history(sym, days)
-    if df is not None and not df.empty:
-        return df
-
-    log.info("Stooq failed for %s, trying YF chart API...", sym)
+    log.info("yfinance failed for %s, trying YF chart API...", sym)
     df = _yf_chart_api(sym, days)
     if df is None:
         log.warning("No historical data returned for %s", sym)
@@ -390,10 +329,9 @@ def get_stock_info(symbol: str) -> dict:
             "currency": getattr(info, "currency", "USD"),
         }
     except Exception as exc:
-        log.warning("fast_info failed for %s (%s), trying Stooq", sym, exc)
+        log.warning("fast_info failed for %s (%s), trying YF chart API", sym, exc)
 
-    # Fallback chain: Stooq → YF chart API
-    for fn in (_stooq_history, _yf_chart_api):
+    for fn in (_yf_chart_api,):
         df = fn(sym, 5)
         if df is not None and not df.empty:
             price = float(df["Close"].iloc[-1])
