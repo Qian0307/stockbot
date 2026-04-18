@@ -183,14 +183,14 @@ def _twse_history(symbol: str, months: int = 4) -> Optional[pd.DataFrame]:
 def _stooq_history(symbol: str, days: int) -> Optional[pd.DataFrame]:
     """
     Fetch daily OHLCV from Stooq CSV API.
-    Stooq ticker format: TSLA → tsla.us, AAPL → aapl.us
-    Works from any IP including cloud servers.
+    Stooq ticker: TSLA → tsla.us
     """
-    end = datetime.utcnow()
-    start = end - timedelta(days=days)
     stooq_sym = symbol.lower().replace(".tw", "").replace(".two", "")
     if not _is_taiwan(symbol):
         stooq_sym = stooq_sym + ".us"
+
+    end = datetime.utcnow()
+    start = end - timedelta(days=days)
 
     try:
         resp = requests.get(
@@ -204,21 +204,75 @@ def _stooq_history(symbol: str, days: int) -> Optional[pd.DataFrame]:
             timeout=10,
             headers={"User-Agent": "Mozilla/5.0"},
         )
-        if resp.status_code != 200 or "No data" in resp.text or len(resp.text) < 50:
-            log.warning("Stooq returned no data for %s", stooq_sym)
+        text = resp.text.strip()
+        log.info("Stooq raw response for %s (first 120 chars): %s", stooq_sym, text[:120])
+
+        if resp.status_code != 200 or len(text) < 30 or text.startswith("<"):
+            log.warning("Stooq returned invalid response for %s", stooq_sym)
             return None
 
         from io import StringIO
-        df = pd.read_csv(StringIO(resp.text), index_col=0)
-        df.index = pd.to_datetime(df.index)
+        df = pd.read_csv(StringIO(text), on_bad_lines="skip")
+
+        # Normalise column names (Stooq uses Title Case)
+        df.columns = [c.strip().title() for c in df.columns]
+        if "Date" not in df.columns:
+            log.warning("Stooq: no Date column for %s, columns=%s", stooq_sym, df.columns.tolist())
+            return None
+
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+
         if df.empty:
             return None
-        df = df.sort_index()
-        # Stooq columns: Open, High, Low, Close, Volume
+
         log.info("Stooq history: %d rows for %s", len(df), symbol)
         return df
     except Exception as exc:
         log.warning("Stooq fetch failed for %s: %s", symbol, exc)
+        return None
+
+
+def _yf_chart_api(symbol: str, days: int) -> Optional[pd.DataFrame]:
+    """
+    Direct call to Yahoo Finance v8 chart API — sometimes works when
+    the yfinance library is blocked, because we control the exact headers.
+    """
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    try:
+        resp = requests.get(
+            url,
+            params={"interval": "1d", "range": f"{max(days // 30, 1)}mo"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json",
+                "Referer": "https://finance.yahoo.com",
+            },
+            timeout=10,
+        )
+        data = resp.json()
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            return None
+        r = result[0]
+        timestamps = r.get("timestamp", [])
+        ohlcv = r.get("indicators", {}).get("quote", [{}])[0]
+        adj_close = r.get("indicators", {}).get("adjclose", [{}])[0].get("adjclose", [])
+
+        closes = adj_close if adj_close else ohlcv.get("close", [])
+        df = pd.DataFrame({
+            "Date": pd.to_datetime(timestamps, unit="s"),
+            "Open":   ohlcv.get("open", []),
+            "High":   ohlcv.get("high", []),
+            "Low":    ohlcv.get("low", []),
+            "Close":  closes,
+            "Volume": ohlcv.get("volume", []),
+        }).dropna(subset=["Close"]).set_index("Date").sort_index()
+
+        log.info("YF chart API: %d rows for %s", len(df), symbol)
+        return df if not df.empty else None
+    except Exception as exc:
+        log.warning("YF chart API failed for %s: %s", symbol, exc)
         return None
 
 
@@ -260,7 +314,7 @@ def fetch_history(symbol: str, days: int = INDICATOR_LOOKBACK_DAYS) -> Optional[
             return df
         log.warning("TWSE history failed for %s, trying yfinance", sym)
 
-    # US stocks: try yfinance first, then Stooq
+    # US stocks: yfinance → Stooq → YF chart API
     end = datetime.utcnow()
     start = end - timedelta(days=days)
     df = _download_with_retry(sym, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
@@ -271,9 +325,13 @@ def fetch_history(symbol: str, days: int = INDICATOR_LOOKBACK_DAYS) -> Optional[
         df.index = pd.to_datetime(df.index)
         return df
 
-    # yfinance blocked — fall back to Stooq
     log.info("yfinance failed for %s, trying Stooq...", sym)
     df = _stooq_history(sym, days)
+    if df is not None and not df.empty:
+        return df
+
+    log.info("Stooq failed for %s, trying YF chart API...", sym)
+    df = _yf_chart_api(sym, days)
     if df is None:
         log.warning("No historical data returned for %s", sym)
     return df
@@ -334,16 +392,17 @@ def get_stock_info(symbol: str) -> dict:
     except Exception as exc:
         log.warning("fast_info failed for %s (%s), trying Stooq", sym, exc)
 
-    # Stooq: derive price from last row of history
-    df = _stooq_history(sym, days=5)
-    if df is not None and not df.empty:
-        price = float(df["Close"].iloc[-1])
-        prev = float(df["Close"].iloc[-2]) if len(df) >= 2 else None
-        change_pct = round((price - prev) / prev * 100, 2) if prev else None
-        return {
-            "symbol": sym, "price": price, "prev_close": prev,
-            "change_pct": change_pct, "volume": None, "currency": "USD",
-        }
+    # Fallback chain: Stooq → YF chart API
+    for fn in (_stooq_history, _yf_chart_api):
+        df = fn(sym, 5)
+        if df is not None and not df.empty:
+            price = float(df["Close"].iloc[-1])
+            prev  = float(df["Close"].iloc[-2]) if len(df) >= 2 else None
+            change_pct = round((price - prev) / prev * 100, 2) if prev else None
+            return {
+                "symbol": sym, "price": price, "prev_close": prev,
+                "change_pct": change_pct, "volume": None, "currency": "USD",
+            }
 
     return {
         "symbol": sym, "price": None, "prev_close": None,
