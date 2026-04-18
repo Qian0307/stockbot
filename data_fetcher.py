@@ -37,6 +37,8 @@ _SESSION.headers.update({
 _TWSE_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 # TWSE historical daily data API (returns one month per request)
 _TWSE_HISTORY_URL = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
+# Stooq CSV API — free, no key, works from cloud IPs
+_STOOQ_URL = "https://stooq.com/q/d/l/"
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -176,6 +178,49 @@ def _twse_history(symbol: str, months: int = 4) -> Optional[pd.DataFrame]:
     return df
 
 
+# ── Stooq history for US stocks ────────────────────────────────────────────
+
+def _stooq_history(symbol: str, days: int) -> Optional[pd.DataFrame]:
+    """
+    Fetch daily OHLCV from Stooq CSV API.
+    Stooq ticker format: TSLA → tsla.us, AAPL → aapl.us
+    Works from any IP including cloud servers.
+    """
+    end = datetime.utcnow()
+    start = end - timedelta(days=days)
+    stooq_sym = symbol.lower().replace(".tw", "").replace(".two", "")
+    if not _is_taiwan(symbol):
+        stooq_sym = stooq_sym + ".us"
+
+    try:
+        resp = requests.get(
+            _STOOQ_URL,
+            params={
+                "s": stooq_sym,
+                "d1": start.strftime("%Y%m%d"),
+                "d2": end.strftime("%Y%m%d"),
+                "i": "d",
+            },
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if resp.status_code != 200 or "No data" in resp.text or len(resp.text) < 50:
+            log.warning("Stooq returned no data for %s", stooq_sym)
+            return None
+
+        from io import StringIO
+        df = pd.read_csv(StringIO(resp.text), parse_dates=["Date"], index_col="Date")
+        if df.empty:
+            return None
+        df = df.sort_index()
+        # Stooq columns: Open, High, Low, Close, Volume
+        log.info("Stooq history: %d rows for %s", len(df), symbol)
+        return df
+    except Exception as exc:
+        log.warning("Stooq fetch failed for %s: %s", symbol, exc)
+        return None
+
+
 # ── Yahoo Finance history (needed for MA / RSI) ────────────────────────────
 
 def _download_with_retry(sym: str, start: str, end: str, retries: int = 3) -> Optional[pd.DataFrame]:
@@ -214,18 +259,22 @@ def fetch_history(symbol: str, days: int = INDICATOR_LOOKBACK_DAYS) -> Optional[
             return df
         log.warning("TWSE history failed for %s, trying yfinance", sym)
 
-    # US stocks (or TWSE fallback)
+    # US stocks: try yfinance first, then Stooq
     end = datetime.utcnow()
     start = end - timedelta(days=days)
     df = _download_with_retry(sym, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+
+    if df is not None and not df.empty:
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df.index = pd.to_datetime(df.index)
+        return df
+
+    # yfinance blocked — fall back to Stooq
+    log.info("yfinance failed for %s, trying Stooq...", sym)
+    df = _stooq_history(sym, days)
     if df is None:
         log.warning("No historical data returned for %s", sym)
-        return None
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-
-    df.index = pd.to_datetime(df.index)
     return df
 
 
@@ -266,7 +315,7 @@ def get_stock_info(symbol: str) -> dict:
             "change_pct": None, "volume": None, "currency": "TWD",
         }
 
-    # ── US stocks ────────────────────────────────────────────────────────────
+    # ── US stocks: yfinance fast_info → Stooq fallback ──────────────────────
     try:
         ticker = yf.Ticker(sym, session=_SESSION)
         info = ticker.fast_info
@@ -282,9 +331,20 @@ def get_stock_info(symbol: str) -> dict:
             "currency": getattr(info, "currency", "USD"),
         }
     except Exception as exc:
-        log.warning("fast_info failed for %s (%s), falling back to history", sym, exc)
-        price = get_current_price(symbol)
+        log.warning("fast_info failed for %s (%s), trying Stooq", sym, exc)
+
+    # Stooq: derive price from last row of history
+    df = _stooq_history(sym, days=5)
+    if df is not None and not df.empty:
+        price = float(df["Close"].iloc[-1])
+        prev = float(df["Close"].iloc[-2]) if len(df) >= 2 else None
+        change_pct = round((price - prev) / prev * 100, 2) if prev else None
         return {
-            "symbol": sym, "price": price, "prev_close": None,
-            "change_pct": None, "volume": None, "currency": "USD",
+            "symbol": sym, "price": price, "prev_close": prev,
+            "change_pct": change_pct, "volume": None, "currency": "USD",
         }
+
+    return {
+        "symbol": sym, "price": None, "prev_close": None,
+        "change_pct": None, "volume": None, "currency": "USD",
+    }
