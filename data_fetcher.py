@@ -33,8 +33,10 @@ _SESSION.headers.update({
     "Accept-Language": "en-US,en;q=0.5",
 })
 
-# TWSE MIS real-time API (no auth required, works from any IP)
+# TWSE MIS real-time API
 _TWSE_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+# TWSE historical daily data API (returns one month per request)
+_TWSE_HISTORY_URL = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -111,6 +113,69 @@ def _twse_price(symbol: str) -> Optional[dict]:
         return None
 
 
+# ── TWSE historical data (台股月歷史資料) ──────────────────────────────────
+
+def _twse_history(symbol: str, months: int = 4) -> Optional[pd.DataFrame]:
+    """
+    Fetch daily OHLCV history from TWSE for the past *months* months.
+    Each API call returns one month; we fetch and concatenate.
+    Column mapping: 開盤價→Open, 最高價→High, 最低價→Low, 收盤價→Close, 成交股數→Volume
+    """
+    code = symbol.replace(".TW", "").replace(".TWO", "")
+    frames = []
+    today = datetime.utcnow()
+
+    for i in range(months):
+        # Walk backwards month by month
+        target = today - timedelta(days=i * 31)
+        date_str = target.strftime("%Y%m01")
+        try:
+            resp = requests.get(
+                _TWSE_HISTORY_URL,
+                params={"response": "json", "date": date_str, "stockNo": code},
+                timeout=10,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            data = resp.json()
+            if data.get("stat") != "OK":
+                continue
+            rows = data.get("data", [])
+            # columns: 日期 成交股數 成交金額 開盤價 最高價 最低價 收盤價 漲跌價差 成交筆數
+            records = []
+            for row in rows:
+                try:
+                    # Date is in ROC format: "113/04/18" → convert to Gregorian
+                    roc_date = row[0]
+                    parts = roc_date.split("/")
+                    year = int(parts[0]) + 1911
+                    date = datetime(year, int(parts[1]), int(parts[2]))
+                    # Strip commas from numbers
+                    def to_f(s):
+                        return float(str(s).replace(",", ""))
+                    records.append({
+                        "Date": date,
+                        "Open": to_f(row[3]),
+                        "High": to_f(row[4]),
+                        "Low": to_f(row[5]),
+                        "Close": to_f(row[6]),
+                        "Volume": to_f(row[1]),
+                    })
+                except Exception:
+                    continue
+            if records:
+                frames.append(pd.DataFrame(records).set_index("Date"))
+        except Exception as exc:
+            log.warning("TWSE history fetch failed for %s month %s: %s", code, date_str, exc)
+
+    if not frames:
+        return None
+
+    df = pd.concat(frames).sort_index()
+    df = df[~df.index.duplicated()]
+    log.info("TWSE history: %d rows for %s", len(df), symbol)
+    return df
+
+
 # ── Yahoo Finance history (needed for MA / RSI) ────────────────────────────
 
 def _download_with_retry(sym: str, start: str, end: str, retries: int = 3) -> Optional[pd.DataFrame]:
@@ -136,13 +201,22 @@ def _download_with_retry(sym: str, start: str, end: str, retries: int = 3) -> Op
 def fetch_history(symbol: str, days: int = INDICATOR_LOOKBACK_DAYS) -> Optional[pd.DataFrame]:
     """
     Download OHLCV history. Returns flattened DataFrame or None.
-    For Taiwan stocks yfinance may fail from cloud IPs — callers should
-    handle None gracefully (indicators will show N/A).
+    Taiwan stocks: TWSE history API first, yfinance as secondary.
+    US stocks: yfinance only.
     """
     sym = _normalize_symbol(symbol)
+
+    # Taiwan stocks — use TWSE official historical API
+    if _is_taiwan(sym):
+        months_needed = max(4, days // 30 + 1)
+        df = _twse_history(sym, months=months_needed)
+        if df is not None and not df.empty:
+            return df
+        log.warning("TWSE history failed for %s, trying yfinance", sym)
+
+    # US stocks (or TWSE fallback)
     end = datetime.utcnow()
     start = end - timedelta(days=days)
-
     df = _download_with_retry(sym, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
     if df is None:
         log.warning("No historical data returned for %s", sym)
@@ -152,7 +226,6 @@ def fetch_history(symbol: str, days: int = INDICATOR_LOOKBACK_DAYS) -> Optional[
         df.columns = df.columns.get_level_values(0)
 
     df.index = pd.to_datetime(df.index)
-    log.info("Fetched %d rows for %s", len(df), sym)
     return df
 
 
