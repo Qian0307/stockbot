@@ -209,7 +209,8 @@ def _stooq_history(symbol: str, days: int) -> Optional[pd.DataFrame]:
             return None
 
         from io import StringIO
-        df = pd.read_csv(StringIO(resp.text), parse_dates=["Date"], index_col="Date")
+        df = pd.read_csv(StringIO(resp.text), index_col=0)
+        df.index = pd.to_datetime(df.index)
         if df.empty:
             return None
         df = df.sort_index()
